@@ -1,0 +1,226 @@
+# Gộp: Postgres + MinIO + Oracle + Kafka (KRaft) + Kafka UI
+# Chạy: docker compose up -d   (Oracle tự tạo user IMGDATA + bảng IMAGES lần đầu)
+
+name: platform
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "20m", max-file: "5" }
+
+services:
+
+  # ───────────── PostgreSQL ─────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    shm_size: 256mb
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+      APP_RW_USER: ${APP_RW_USER}
+      APP_RW_PASSWORD: ${APP_RW_PASSWORD}
+      APP_RO_USER: ${APP_RO_USER}
+      APP_RO_PASSWORD: ${APP_RO_PASSWORD}
+    command: >
+      postgres
+      -c password_encryption=scram-sha-256
+      -c max_connections=200
+      -c shared_buffers=1GB
+      -c effective_cache_size=3GB
+      -c log_min_duration_statement=1000
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    configs:
+      - source: pg_init
+        target: /docker-entrypoint-initdb.d/01-roles.sh
+        mode: 0755
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    security_opt: ["no-new-privileges:true"]
+    stop_grace_period: 60s
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 4G }
+    logging: *logging
+
+  # ───────────── MinIO ─────────────
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Console
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    security_opt: ["no-new-privileges:true"]
+    stop_grace_period: 60s
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 6G }
+    logging: *logging
+
+  # Chạy 1 lần: tạo bucket + 2 user (chạy lại vẫn an toàn)
+  minio-init:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      BUCKET: ${MINIO_BUCKET}
+      RW_USER: ${MINIO_RW_USER}
+      RW_PASSWORD: ${MINIO_RW_PASSWORD}
+      RO_USER: ${MINIO_RO_USER}
+      RO_PASSWORD: ${MINIO_RO_PASSWORD}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        mc mb --ignore-existing "local/$$BUCKET"
+        mc admin user add local "$$RW_USER" "$$RW_PASSWORD"
+        mc admin user add local "$$RO_USER" "$$RO_PASSWORD"
+        mc admin policy attach local readwrite --user "$$RW_USER" || true
+        mc admin policy attach local readonly  --user "$$RO_USER" || true
+        echo "MinIO init xong."
+    security_opt: ["no-new-privileges:true"]
+    logging: *logging
+
+  # ───────────── Oracle ─────────────
+  oracle-db:
+    image: gvenzl/oracle-xe:21-slim
+    container_name: oracle_21c_xe
+    ports:
+      - "1521:1521"
+    environment:
+      - ORACLE_PASSWORD=Nam12345
+    volumes:
+      - oracle_data:/opt/oracle/oradata
+      # *.sql trong thư mục này tự chạy 1 lần sau khi DB khởi tạo xong
+      - ./oracle-init:/container-entrypoint-initdb.d:ro
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'SELECT 1 FROM dual;' | sqlplus -s system/Nam12345@//localhost:1521/XEPDB1 | grep -q 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  # ───────────── Kafka (KRaft) ─────────────
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # HOST: cho ứng dụng trên máy host (localhost:9092)
+      # DOCKER: cho container khác cùng network (kafka:29092)
+      KAFKA_LISTENERS: HOST://:9092,DOCKER://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: HOST://localhost:9092,DOCKER://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: HOST:PLAINTEXT,DOCKER:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: DOCKER
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+
+      KAFKA_HEAP_OPTS: -Xms512m -Xmx512m
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    security_opt: ["no-new-privileges:true"]
+    stop_grace_period: 60s
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 1G }
+    logging: *logging
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-ui
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      DYNAMIC_CONFIG_ENABLED: "false"
+      JAVA_OPTS: -Xms128m -Xmx256m
+      AUTH_TYPE: LOGIN_FORM
+      SPRING_SECURITY_USER_NAME: admin
+      SPRING_SECURITY_USER_PASSWORD: CHANGE_ME_KAFKA_UI
+    ports:
+      - "127.0.0.1:8080:8080"
+    security_opt: ["no-new-privileges:true"]
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 512M }
+    logging: *logging
+
+configs:
+  # Script tạo 2 user Postgres, chỉ chạy ở lần khởi tạo đầu tiên (khi pg_data còn trống)
+  pg_init:
+    content: |
+      #!/bin/bash
+      set -e
+      psql -v ON_ERROR_STOP=1 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" <<EOSQL
+      CREATE ROLE $$APP_RW_USER LOGIN PASSWORD '$$APP_RW_PASSWORD';
+      CREATE ROLE $$APP_RO_USER LOGIN PASSWORD '$$APP_RO_PASSWORD';
+      REVOKE ALL ON DATABASE "$$POSTGRES_DB" FROM PUBLIC;
+      REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+      GRANT CONNECT ON DATABASE "$$POSTGRES_DB" TO $$APP_RW_USER, $$APP_RO_USER;
+      GRANT USAGE ON SCHEMA public TO $$APP_RW_USER, $$APP_RO_USER;
+      GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO $$APP_RW_USER;
+      GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO $$APP_RW_USER;
+      GRANT SELECT ON ALL TABLES IN SCHEMA public TO $$APP_RO_USER;
+      ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO $$APP_RW_USER;
+      ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO $$APP_RW_USER;
+      ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO $$APP_RO_USER;
+      ALTER ROLE $$APP_RO_USER SET default_transaction_read_only = on;
+      EOSQL
+
+volumes:
+  pg_data:
+  minio_data:
+  kafka_data:
+  oracle_data:
