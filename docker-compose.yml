@@ -1,6 +1,6 @@
-# Gộp: Postgres + MinIO + Oracle + Kafka (KRaft) + Kafka UI
+# Gộp: Postgres + RustFS + Oracle + Kafka (KRaft) + Kafka UI
 # Chạy: docker compose up -d
-# Lần đầu Oracle tự tạo user IMGDATA + bảng IMAGES (oracle-init/01_create_user_and_table.sql)
+# Lần đầu Oracle tự tạo user IMGDATA + bảng IMAGES (create_user_and_table.sql)
 
 name: platform
 
@@ -53,28 +53,44 @@ services:
         limits: { cpus: "2.0", memory: 4G }
     logging: *logging
 
-  # ───────────── MinIO ─────────────
-  minio:
-    # alpine/minio bundle sẵn cả minio server + mc client trong 1 image
-    image: alpine/minio:RELEASE.2025-10-15T17-29-55Z
-    container_name: minio
-    restart: unless-stopped
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+  # ───────────── RustFS ─────────────
+  # RustFS chạy bằng UID/GID 10001 nên cần sửa quyền thư mục bind mount trước.
+  rustfs-permissions:
+    image: alpine:3.19
+    user: "0:0"
+    restart: "no"
+    command: ["chown", "-R", "10001:10001", "/data/rustfs"]
     volumes:
-      - minio_data:/data
+      - ./data:/data/rustfs
+    security_opt: ["no-new-privileges:true"]
+    logging: *logging
+
+  rustfs:
+    image: rustfs/rustfs:1.0.4
+    container_name: rustfs-server
+    restart: unless-stopped
+    environment:
+      RUSTFS_VOLUMES: /data/rustfs
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      # Tạm dùng lại credential hiện có trong .env.
+      RUSTFS_ACCESS_KEY: ${MINIO_ROOT_USER}
+      RUSTFS_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ./data:/data/rustfs
+    depends_on:
+      rustfs-permissions:
+        condition: service_completed_successfully
     ports:
       - "9000:9000"   # S3 API
       - "9001:9001"   # Console
     healthcheck:
-      # Dùng wget (có sẵn trong Alpine) thay vì "mc ready local" (alias chưa set ở đây)
-      test: ["CMD-SHELL", "wget -qO- http://localhost:9000/minio/health/ready || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/health || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 10
-      start_period: 15s
+      start_period: 40s
     security_opt: ["no-new-privileges:true"]
     stop_grace_period: 60s
     deploy:
@@ -82,34 +98,94 @@ services:
         limits: { cpus: "2.0", memory: 6G }
     logging: *logging
 
-  # Chạy 1 lần sau khi minio sẵn sàng: tạo bucket + 2 user (chạy lại vẫn an toàn)
-  minio-init:
-    # Dùng cùng image alpine/minio → không cần pull thêm image thứ 2
-    image: alpine/minio:RELEASE.2025-10-15T17-29-55Z
+  # Chạy một lần sau khi RustFS sẵn sàng để tạo bucket, policy và user ứng dụng.
+  rustfs-init:
+    image: rustfs/rc:v0.1.37
+    container_name: rustfs-automation
     restart: "no"
     depends_on:
-      minio:
+      rustfs:
         condition: service_healthy
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-      BUCKET: ${MINIO_BUCKET}
-      RW_USER: ${MINIO_RW_USER}
-      RW_PASSWORD: ${MINIO_RW_PASSWORD}
-      RO_USER: ${MINIO_RO_USER}
-      RO_PASSWORD: ${MINIO_RO_PASSWORD}
-    entrypoint:
-      - /bin/sh
-      - -c
+      RUSTFS_ADMIN_USER: ${MINIO_ROOT_USER}
+      RUSTFS_ADMIN_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      RUSTFS_BUCKET: ${MINIO_BUCKET}
+      RUSTFS_RW_USER: ${MINIO_RW_USER}
+      RUSTFS_RW_PASSWORD: ${MINIO_RW_PASSWORD}
+      RUSTFS_RO_USER: ${MINIO_RO_USER}
+      RUSTFS_RO_PASSWORD: ${MINIO_RO_PASSWORD}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
       - |
-        set -e
-        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
-        mc mb --ignore-existing "local/$$BUCKET"
-        mc admin user add local "$$RW_USER" "$$RW_PASSWORD"
-        mc admin user add local "$$RO_USER" "$$RO_PASSWORD"
-        mc admin policy attach local readwrite --user "$$RW_USER" || true
-        mc admin policy attach local readonly  --user "$$RO_USER" || true
-        echo "MinIO init xong."
+        set -eu
+
+        rc alias set local http://rustfs:9000 \
+          "$$RUSTFS_ADMIN_USER" "$$RUSTFS_ADMIN_PASSWORD"
+        rc bucket create "local/$$RUSTFS_BUCKET" --ignore-existing
+
+        cat > /tmp/readwrite-policy.json <<EOF
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetBucketLocation",
+                "s3:ListBucket",
+                "s3:ListBucketMultipartUploads"
+              ],
+              "Resource": ["arn:aws:s3:::$$RUSTFS_BUCKET"]
+            },
+            {
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject",
+                "s3:AbortMultipartUpload",
+                "s3:ListMultipartUploadParts"
+              ],
+              "Resource": ["arn:aws:s3:::$$RUSTFS_BUCKET/*"]
+            }
+          ]
+        }
+        EOF
+
+        cat > /tmp/readonly-policy.json <<EOF
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": ["s3:GetBucketLocation", "s3:ListBucket"],
+              "Resource": ["arn:aws:s3:::$$RUSTFS_BUCKET"]
+            },
+            {
+              "Effect": "Allow",
+              "Action": ["s3:GetObject"],
+              "Resource": ["arn:aws:s3:::$$RUSTFS_BUCKET/*"]
+            }
+          ]
+        }
+        EOF
+
+        if ! rc admin policy info local app-bucket-readwrite >/dev/null 2>&1; then
+          rc admin policy create local app-bucket-readwrite /tmp/readwrite-policy.json
+        fi
+        if ! rc admin policy info local app-bucket-readonly >/dev/null 2>&1; then
+          rc admin policy create local app-bucket-readonly /tmp/readonly-policy.json
+        fi
+
+        if ! rc admin user info local "$$RUSTFS_RW_USER" >/dev/null 2>&1; then
+          rc admin user add local "$$RUSTFS_RW_USER" "$$RUSTFS_RW_PASSWORD"
+        fi
+        if ! rc admin user info local "$$RUSTFS_RO_USER" >/dev/null 2>&1; then
+          rc admin user add local "$$RUSTFS_RO_USER" "$$RUSTFS_RO_PASSWORD"
+        fi
+
+        rc admin policy attach local app-bucket-readwrite --user "$$RUSTFS_RW_USER"
+        rc admin policy attach local app-bucket-readonly --user "$$RUSTFS_RO_USER"
+        echo "RustFS init xong: bucket=$$RUSTFS_BUCKET"
     security_opt: ["no-new-privileges:true"]
     logging: *logging
 
@@ -122,8 +198,8 @@ services:
       - ORACLE_PASSWORD=Nam12345
     volumes:
       - oracle_data:/opt/oracle/oradata
-      # SQL trong thư mục này tự chạy 1 lần sau khi DB khởi tạo xong
-      - ./oracle-init:/container-entrypoint-initdb.d:ro
+      # File SQL tự chạy 1 lần sau khi DB khởi tạo xong
+      - ./create_user_and_table.sql:/container-entrypoint-initdb.d/01_create_user_and_table.sql:ro
     ports:
       - "1521:1521"
     healthcheck:
@@ -136,7 +212,7 @@ services:
 
   # ───────────── Kafka (KRaft – không cần Zookeeper) ─────────────
   kafka:
-    image: apache/kafka:3.9.0
+    image: apache/kafka:4.3.2
     container_name: kafka
     restart: unless-stopped
     environment:
@@ -157,7 +233,7 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
 
-      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_RETENTION_HOURS: 500
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       KAFKA_LOG_DIRS: /var/lib/kafka/data
 
@@ -193,7 +269,7 @@ services:
       JAVA_OPTS: -Xms128m -Xmx256m
       AUTH_TYPE: LOGIN_FORM
       SPRING_SECURITY_USER_NAME: admin
-      SPRING_SECURITY_USER_PASSWORD: CHANGE_ME_KAFKA_UI
+      SPRING_SECURITY_USER_PASSWORD: admin123@321
     ports:
       - "127.0.0.1:8080:8080"
     security_opt: ["no-new-privileges:true"]
@@ -226,6 +302,5 @@ configs:
 
 volumes:
   pg_data:
-  minio_data:
   kafka_data:
   oracle_data:
